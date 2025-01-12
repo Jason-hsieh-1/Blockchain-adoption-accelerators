@@ -1,0 +1,997 @@
+---
+title: "Code - Thesis"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r pressure, echo=FALSE}
+# clean the environment
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE) 
+rm(list=ls()) 
+set.seed(41) 
+options(scipen=10000) 
+```
+
+```{r}
+library(tidyverse) 
+library(readr)
+library(ggplot2)
+library(dplyr)
+library(magrittr)
+library(stringr)
+```
+# dive into Helium Network data
+## clean and process dataset
+### import data from Helium Network
+```{r}
+hotspot_data <- read_delim("hotspots_worldwide.csv", show_col_types = FALSE)
+```
+
+### take a first look at the dataset
+```{r}
+View(hotspot_data)
+```
+
+```{r}
+summary(hotspot_data)
+```
+
+### Data cleaning version 1: filter data by date and eliminate unnecessary columns
+```{r}
+hotspot_data_selected <- hotspot_data %>%
+  select(-address, -owner, -location, -last_poc_challenge, -last_poc_onion_key_hash, 
+         -name, -location_hex, -geometry) %>%
+  mutate(first_timestamp = as_date(first_timestamp)) %>%
+  filter(first_timestamp >= as_date("2020-01-01") & first_timestamp <= as_date("2022-06-30")) %>%
+  mutate(first_timestamp_month = format(first_timestamp, "%Y-%m"))
+```
+
+### US map by time
+```{r}
+library(usmap) #import the package
+
+# define time range to see the difference between cities in a boarder view
+time_range1 <- c("2020-01", "2020-02", "2020-03", "2020-04", "2020-05", "2020-06", "2020-07",
+                 "2020-08", "2020-09", "2020-10")
+time_range2 <- c("2020-11", "2020-12", "2021-01", "2021-02", "2021-03", "2021-04", "2021-05",
+                 "2021-06", "2021-07", "2021-08")
+time_range3 <- c("2021-09", "2021-10", "2021-11", "2021-12", "2022-01", "2022-02", "2022-03",
+                 "2022-04", "2022-05", "2022-06")
+hotspot_data_timerange <- hotspot_data_selected %>%
+  mutate(time_range = ifelse(first_timestamp_month %in% time_range1, "1",
+                      ifelse(first_timestamp_month %in% time_range2, "2",
+                      ifelse(first_timestamp_month %in% time_range3, "3", "")))) %>%
+  arrange(time_range)
+
+# United States data
+hotspot_data_usonly <- hotspot_data_timerange %>%
+  filter(long_country == "United States")
+
+# prepare data for mapping
+us_transform_location <- hotspot_data_usonly %>%
+  select(lng, lat, long_city, time_range)
+us_transform_location_2 <- usmap_transform(us_transform_location, input_names = c("lng", "lat"))
+
+# map the United States and create dots for each activation activity of blockchain
+plot_usmap(regions = "states") + 
+  labs(title = "United States") + 
+  geom_sf( 
+    data = us_transform_location_2, 
+    aes(), 
+    color = "black",  # set the color of the dots to black
+    alpha = 0.1  # set the transparency to 10%
+  ) + 
+  # separate by time range defined earlier
+  facet_wrap(~ time_range) +
+  theme(panel.background = element_blank(), 
+        legend.position = "none",
+        text = element_text(family = "Times New Roman"))
+```
+
+### Data cleaning version 2: filter data by date and eliminate unnecessary columns without date limited
+```{r}
+hotspot_data_selected_2 <- hotspot_data %>%
+  # remove unnecessary columns
+  select(-address, -owner, -location, -last_poc_challenge, -last_poc_onion_key_hash, 
+         -name, -location_hex, -geometry, -reward_scale) %>%
+  # make sure time is date format
+  mutate(first_timestamp = as_date(first_timestamp)) %>%
+  # remove testing data from Helium
+  filter(first_timestamp != as.Date("1970-01-01"))
+```
+
+### focus on United States
+```{r}
+hotspot_data_selected_2_US <- hotspot_data_selected_2 %>%
+  # United States Focus
+  filter(long_country == "United States")
+```
+
+# dependent variable - adoption speed
+## group by city and state based on selected version of dataset
+```{r}
+total_adoption_US_rogers_uniquecity <- hotspot_data_selected_2_US %>%
+  group_by(long_city, short_state, long_state) %>%
+  # calculate the total adoption of each unique city
+  summarise(total_adoption = n()) 
+
+# There are some cities with the same name in different states, so to avoid that, group by city and state at the same time
+```
+
+## calculate the total adoption based on city, state, and fisrt date of activation
+```{r}
+total_adoption_date_US_rogers_uniquecity <- hotspot_data_selected_2_US %>%
+  # ensure no NA in city
+  filter(!is.na(long_city)) %>%
+  group_by(long_city, short_state, long_state, first_timestamp) %>%
+  # calculate the total number of hotspot activated in each city by date
+  summarise(total_adoption_city_date = n()) %>%
+  # ungroup to further process the data
+  ungroup() 
+
+```
+
+## calculate cumulative adoption for each city in time series
+```{r}
+percent_date_Us_rogers_uniquecity <- total_adoption_date_US_rogers_uniquecity %>%
+  # ensure unique city
+  group_by(long_city, short_state, long_state) %>%
+  # calcualte the cumulative adoption by city and date
+  summarise(cumulative_adoptions = cumsum(total_adoption_city_date)) %>%
+  ungroup() %>%
+  # combine dataset itself to expand calculation potential
+  left_join(total_adoption_US_rogers_uniquecity, by=c("long_city", "short_state", "long_state")) %>%
+  # calculate the penetration rate by city and in each date
+  mutate(percent_penetration = (cumulative_adoptions / total_adoption) * 100) %>%
+  # add first activation date of hotspot back
+  mutate(first_timestamp = total_adoption_date_US_rogers_uniquecity %>%
+           pull(first_timestamp))
+```
+
+## calculate the threshold of 0% (innovator) 2.5% (early adopter) 16% (early majority) 50% and obtain the date for defined range  (Rogers research)
+```{r}
+range_percent_US_rogers_uniquecity <- percent_date_Us_rogers_uniquecity %>%
+  # make sure the adoptions are significant
+  filter(total_adoption > 500) %>%
+  group_by(long_city, short_state, long_state) %>%
+  arrange(first_timestamp) %>%
+  # calculate percent of and cumulative adoptions, and pull out dates when it's reached
+  summarise(
+    # find first adoption and its date
+    percent_penetration_0 = first(percent_penetration[percent_penetration == min(percent_penetration)]),
+    date_0 = first(first_timestamp[percent_penetration == min(percent_penetration)]),
+    # find the market penetration of 2.5% and the date when the threshold is reached
+    percent_penetration_2_5 = first(percent_penetration[percent_penetration >= 2.5]),
+    date_2_5 = first(first_timestamp[percent_penetration >= 2.5]),
+    # find the market penetration of 16% and the date when the threshold is reached
+    percent_penetration_16 = first(percent_penetration[percent_penetration >= 16]),
+    date_16 = first(first_timestamp[percent_penetration >= 16]),
+    # find the market penetration of 50% and the date when the threshold is reached
+    percent_penetration_50 = first(percent_penetration[percent_penetration >= 50]),
+    date_50 = first(first_timestamp[percent_penetration >= 50]),
+    total_adoption = first(total_adoption),
+    # calculate cumulative adoptions by each threshold
+    cumulative_adoptions_0 = first(cumulative_adoptions[percent_penetration == min(percent_penetration)]),
+    cumulative_adoptions_2_5 = first(cumulative_adoptions[percent_penetration >= 2.5]),
+    cumulative_adoptions_16 = first(cumulative_adoptions[percent_penetration >= 16]),
+    cumulative_adoptions_50 = first(cumulative_adoptions[percent_penetration >= 50])
+  ) %>%
+  # for further processing of the data
+  ungroup()
+```
+
+## calculate adoption speed by diff of cumulative adoptions / diff of days between each threshold
+```{r}
+adoption_speed_US_rogers_uniquecity <- range_percent_US_rogers_uniquecity %>%
+  # ensure its numeric and calculate the difference between each threshold
+  # understand how many adoptions happened in each threshold period
+  mutate(
+    # adoption speed version 1: days needed to reach next threshold (chosen to use)
+    days_0_to_2_5 = as.numeric(difftime(date_2_5, date_0, units = "days")),
+    days_2_5_to_16 = as.numeric(difftime(date_16, date_2_5, units = "days")),
+    days_16_to_50 = as.numeric(difftime(date_50, date_16, units = "days")),
+    # calculate how many new adoptions occur between thresholds
+    diff_cumulative_0_to_2_5 = cumulative_adoptions_2_5 - cumulative_adoptions_0,
+    diff_cumulative_2_5_to_16 = cumulative_adoptions_16 - cumulative_adoptions_2_5,
+    diff_cumulative_16_to_50 = cumulative_adoptions_50 - cumulative_adoptions_16,
+    # adoption speed version 2: difference of adoptions between thresholds per day (not used at the end)
+    adoption_speed_0_to_2_5 = ifelse(days_0_to_2_5 > 0, diff_cumulative_0_to_2_5 / days_0_to_2_5, NA),
+    adoption_speed_2_5_to_16 = ifelse(days_2_5_to_16 > 0, diff_cumulative_2_5_to_16 / days_2_5_to_16, NA),
+    adoption_speed_16_to_50 = ifelse(days_16_to_50 > 0, diff_cumulative_16_to_50 / days_16_to_50, NA)
+  )
+```
+
+## compare adoption speed in different threshold (whether innovator < eraly adopter < eraly majority)
+```{r}
+# understand adoption speed version 2
+adoption_speed_US_rogers_uniquecity %>%
+  mutate(
+    speed_check = adoption_speed_16_to_50 > adoption_speed_2_5_to_16 & adoption_speed_2_5_to_16 > adoption_speed_0_to_2_5
+  )
+  
+# Austin and San Fransisco have false results, and further investigation tells that the innovator adopt even faster than early adopter.
+```
+## plot the adoption speed dot plot to compare the difference by city with arrangement of date in innovator period
+```{r}
+# ensure the cities are sorted by days needed in first threshold interval
+adoption_speed_US_arrange_rogers_uniquecity <- adoption_speed_US_rogers_uniquecity %>%
+  arrange(desc(days_0_to_2_5)) %>%
+  mutate(long_city = factor(long_city, levels = long_city))
+
+# Create the plot based on adoptin speed version 1
+ggplot(adoption_speed_US_arrange_rogers_uniquecity, aes(y = long_city)) +
+  geom_point(aes(x = days_0_to_2_5, color = 'days_0_to_2_5'), shape = 16, size = 3) +
+  geom_point(aes(x = days_2_5_to_16, color = 'days_2_5_to_16'), shape = 16, size = 3) +
+  geom_point(aes(x = days_16_to_50, color = 'days_16_to_50'), shape = 16, size = 3) +
+  labs(x = "Adoption Speed", y = "City", title = "Adoption Speeds by City") +
+  scale_color_manual(name = "Adoption Speed Stages",
+                     values = c("days_0_to_2_5" = "blue",
+                                "days_2_5_to_16" = "green",
+                                "days_16_to_50" = "red")) +
+  scale_x_log10() +
+  theme(text = element_text(family = "Times New Roman"))
+
+```
+
+## adjust the adoption speed dataset to further conduct regression analysis
+```{r}
+adoption_speed_US_rogers_uniquecity_selected <- adoption_speed_US_rogers_uniquecity %>%
+  # to be matched with the columns of open-source dataset
+  rename(City = long_city, State = long_state) %>%
+  select(City, State, days_0_to_2_5, days_2_5_to_16, days_16_to_50)
+```
+
+
+# independent variables - internet speed, education, income, age, population
+## Internet Speed
+### import broadband dataset from FCC broadband map
+```{r}
+usbroadband_data <- read_delim("fixed_broadband_summary_by_geography_us.csv", show_col_types = FALSE)
+```
+
+### Broadband - adjust the broadband (internet speed) dataset to match the helium netowrk dateset - city
+```{r}
+usbroadband_data_county <- usbroadband_data %>%
+  filter(geography_type %in% c("County", "Congressional District", "CBSA (MSA)"), technology == "All Wired and Licensed Fixed Wireless", 
+         #filter State to correpond to the original dataset, and technology is filter by all wired and fixed wireless because it's more common device: https://www.pewtrusts.org/en/research-and-analysis/fact-sheets/2022/07/how-do-americans-connect-to-the-internet#:~:text=Wireline%20connections%20are%20most%20common,wire%E2%80%94running%20to%20a%20structure..
+         biz_res == "R", area_data_type == "Total"
+         # filter biz_res because the research focus is in individual, and R means residencial area. Area data type is filtered by total because I want to see the full impact.
+         ) %>%
+  #select(-speed_02_02, -speed_10_1, -speed_25_3, -speed_1000_100) %>% # I select speed_100_20 and speed_250_25 because the former is the definition of high speed internet nowadays: https://hyperfiber.com/what-is-a-good-internet-speed#:~:text=What%20is%20Good%20Internet%20Speed,(Mbps)%20for%20upload%20speeds, and the latter gives more significant difference between states.
+  separate(geography_desc_full, into = c("City", "Ab."), sep = ", ") %>% 
+  separate_rows(City, sep = "-") %>%
+  # check the consistency between data set (helium network and broadband)
+  { .[["City"]][.["City"] == "Alexandria city"] <- "Alexandria"; . } %>%
+  { .[["City"]][.["City"] == "Louisville/Jefferson County"] <- "Louisville"; . } %>%
+  { .[["City"]][.["City"] == "Palm Beach"] <- "West Palm Beach"; . } %>%
+  filter(City %in% c("Albuquerque", "Alexandria", "Anaheim", "Arlington", "Atlanta",
+            "Aurora", "Austin", "Bakersfield", "Baltimore", "Boca Raton",
+            "Boise", "Boston", "Bronx", "Brooklyn", "Buffalo",
+            "Cape Coral", "Charlotte", "Chicago", "Chula Vista", "Cincinnati",
+            "Cleveland", "Colorado Springs", "Columbus", "Dallas", "Denver",
+            "El Paso", "Fayetteville", "Fort Lauderdale", "Fort Worth", "Fremont",
+            "Fresno", "Henderson", "Hialeah", "Honolulu", "Houston",
+            "Huntington Beach", "Indianapolis", "Irvine", "Jacksonville", "Jersey City",
+            "Kansas City", "Katy", "Las Vegas", "Long Beach", "Los Angeles",
+            "Louisville", "Memphis", "Mesa", "Miami", "Milwaukee",
+            "Minneapolis", "Nashville", "New York", "Oakland", "Omaha",
+            "Orlando", "Philadelphia", "Phoenix", "Pittsburgh", "Plano",
+            "Portland", "Queens", "Raleigh", "Reno", "Riverside",
+            "Sacramento", "Salt Lake City", "San Antonio", "San Diego", "San Francisco",
+            "San Jose", "Santa Clarita", "Scottsdale", "Seattle", "Spring",
+            "St. Louis", "St. Petersburg", "Tampa", "Tucson", "Washington",
+            "West Palm Beach", "Wichita")) %>%
+  # filter out those with same city name but in different states
+  filter(!geography_id %in% c("10820", "10780", # Alexandria
+                              "46003", # Aurora
+                              "12380", # Austin
+                              "31019", "46017", "55011", # Buffalo
+                              "12015", "51037", # Charlotte
+                              "05025", "37045", "40027", "17380", "17420", # Cleveland
+                              "37047", "17980", "18020", "18060", "18100", # Columbus
+                              "01047", "05039", "19049", "29059", # Dellas
+                              "08041", "48141", # El Paso
+                              "22180", # Fayetteville
+                              "08043", "16043", "19071", "56013", "23340", "23380", # Fremont
+                              "06019", # Fresno
+                              "17071", "21101", "37089", "47077", "48213", "25780", # Henderson
+                              "01069", "13153", "27055", "47083", # Houston
+                              "27300", "27340", "27380", # Jacksonville
+                              "29780", # Las Vegas
+                              "08077", # Mesa
+                              "18103", "20121", "39109", "33060", # Miami
+                              "26125", # Oakland
+                              "54081", # Raleigh
+                              "20155", # Reno
+                              "27137", "41180", # St. Louis
+                              "01129", "05143", "08121", "12133", "13303", "16087", "17189", "18175", 
+                              "19183", "20201", "21229", "22117", "23029", "24043", "27163", "28151", 
+                              "29221", "31177", "36115", "37187", "39167", "40147", "41067","42125", 
+                              "44009", "47179", "48477", "49053", "50023", "51191", "55131", "47780",
+                              "47820", # Washington
+                              "20203", "48485" # Wichita
+                               )) %>%
+  arrange(City) %>%
+  mutate(unique_number = as.character(row_number())) %>%
+  filter(!unique_number %in% c("3", "6", "7", "11", "14", "28", "30", "39", "47","52", "54", "58", "63", 
+                               "67", "72", "74", "78","80")) %>%
+  select(City, speed_250_25)
+```
+
+## education
+### new import
+```{r}
+useducation1_data2 <- read_delim("3ACSST1Y2021.S1501-Data.csv", show_col_types = FALSE)
+```
+
+### adjust the dataset to do further data processing - city
+```{r}
+useducation1_selected_data2 <- useducation1_data2 %>%
+  # select needed (see notes below in this chunk to understand the meaning of each column)
+  select(GEO_ID, NAME, S1501_C01_001E, S1501_C01_005E, S1501_C01_006E, S1501_C01_015E,
+         S1501_C01_016E, S1501_C01_018E, S1501_C01_019E, S1501_C01_021E) %>%
+  filter(GEO_ID != "Geography") %>% # filter out column explanation
+  separate(NAME, into = c("City", "State"), sep = ", ")
+
+# S1501_C01_001E,"Estimate!!Total!!AGE BY EDUCATIONAL ATTAINMENT!!Population 18 to 24 years"
+# S1501_C01_005E,"Estimate!!Total!!AGE BY EDUCATIONAL ATTAINMENT!!Population 18 to 24 years!!Bachelor's degree or higher"
+# S1501_C01_006E,"Estimate!!Total!!AGE BY EDUCATIONAL ATTAINMENT!!Population 25 years and over"
+# S1501_C01_015E,"Estimate!!Total!!AGE BY EDUCATIONAL ATTAINMENT!!Population 25 years and over!!Bachelor's degree or higher"
+# S1501_C01_016E,"Estimate!!Total!!AGE BY EDUCATIONAL ATTAINMENT!!Population 25 to 34 years"
+# S1501_C01_018E,"Estimate!!Total!!AGE BY EDUCATIONAL ATTAINMENT!!Population 25 to 34 years!!Bachelor's 
+# S1501_C01_019E,"Estimate!!Total!!AGE BY EDUCATIONAL ATTAINMENT!!Population 35 to 44 years"
+# S1501_C01_021E,"Estimate!!Total!!AGE BY EDUCATIONAL ATTAINMENT!!Population 35 to 44 years!!Bachelor's degree or higher"
+```
+
+### process the dataset for targeted values to run regression - city
+```{r}
+useducation1_selected_data_city <- useducation1_selected_data2 %>%
+  # remove irrelevant cities
+  filter(!GEO_ID %in% c("1600000US1702154", "1600000US4804000", #Arlington
+                        "1600000US1703012", #Aurora
+                        "1600000US1258350", #Charlotte
+                        "1600000US1319000", #Columbus
+                        "1600000US3722920", #Fayetteville
+                        "1600000US3734200", #Jacksonville
+                        "1600000US2036000", #Kansas City
+                        "1600000US0616532", #Mesa
+                        "1600000US2360545" #Portland
+                        )) %>%
+  { .[["City"]][.["City"] == "Arlington CDP"] <- "Arlington city"; . } %>%
+  { .[["City"]][.["City"] == "Boise City city"] <- "Boise city"; . } %>%
+  { .[["City"]][.["City"] == "Urban Honolulu CDP"] <- "Honolulu city"; . } %>%
+  { .[["City"]][.["City"] == "Indianapolis city (balance)"] <- "Indianapolis city"; . } %>%
+  { .[["City"]][.["City"] == "Louisville/Jefferson County metro government (balance)"] <- "Louisville city"; . } %>%
+  { .[["City"]][.["City"] == "Nashville-Davidson metropolitan government (balance)"] <- "Nashville city"; . } %>%
+  # Convert the columns to numeric
+  mutate(across(c(S1501_C01_001E, S1501_C01_005E, S1501_C01_006E, S1501_C01_015E,
+                  S1501_C01_016E, S1501_C01_018E, S1501_C01_019E, S1501_C01_021E), as.numeric)) %>%
+  # calculate the number of people who age more than 18 years old and have bachelor or higher degree
+  mutate(
+    total_education_poplulation = rowSums(select(
+           ., c("S1501_C01_001E", "S1501_C01_006E")), na.rm = TRUE),
+         total_bachelorup_poplulation = rowSums(select(
+           ., c("S1501_C01_005E", "S1501_C01_015E")), na.rm = TRUE),
+    total_education_poplulation_18_44 = rowSums(select(
+           ., c("S1501_C01_001E", "S1501_C01_016E", "S1501_C01_019E")), na.rm = TRUE),
+         total_bachelorup_poplulation_18_44 = rowSums(select(
+           ., c("S1501_C01_005E", "S1501_C01_018E", "S1501_C01_021E")), na.rm = TRUE)
+  ) %>%
+  # match the city names with Helium dataset
+  mutate(City = str_replace(City, "\\s*(city)$", "")) %>%
+  filter(City %in% c("Albuquerque", "Alexandria", "Anaheim", "Arlington", "Atlanta",
+            "Aurora", "Austin", "Bakersfield", "Baltimore", "Boca Raton",
+            "Boise", "Boston", "Bronx", "Brooklyn", "Buffalo",
+            "Cape Coral", "Charlotte", "Chicago", "Chula Vista", "Cincinnati",
+            "Cleveland", "Colorado Springs", "Columbus", "Dallas", "Denver",
+            "El Paso", "Fayetteville", "Fort Lauderdale", "Fort Worth", "Fremont",
+            "Fresno", "Henderson", "Hialeah", "Honolulu", "Houston",
+            "Huntington Beach", "Indianapolis", "Irvine", "Jacksonville", "Jersey City",
+            "Kansas City", "Katy", "Las Vegas", "Long Beach", "Los Angeles",
+            "Louisville", "Memphis", "Mesa", "Miami", "Milwaukee",
+            "Minneapolis", "Nashville", "New York", "Oakland", "Omaha",
+            "Orlando", "Philadelphia", "Phoenix", "Pittsburgh", "Plano",
+            "Portland", "Queens", "Raleigh", "Reno", "Riverside",
+            "Sacramento", "Salt Lake City", "San Antonio", "San Diego", "San Francisco",
+            "San Jose", "Santa Clarita", "Scottsdale", "Seattle", "Spring",
+            "St. Louis", "St. Petersburg", "Tampa", "Tucson", "Washington",
+            "West Palm Beach", "Wichita")) %>%
+  # group by City and summarize
+  group_by(City) %>%
+  # calculate 
+  summarise(
+    total_education_poplulation_city_2021 = sum(total_education_poplulation, na.rm = TRUE),
+    total_bachelorup_poplulation_city_2021 = sum(total_bachelorup_poplulation, na.rm = TRUE),
+    total_education_population_18_44_city_2021 = sum(total_education_poplulation_18_44, na.rm = TRUE),
+    total_bachelorup_poplulation_18_44_city_2021 = sum(total_bachelorup_poplulation_18_44, na.rm = TRUE)
+  ) %>%
+  mutate(
+    # calculate the percentage of higher education population in each state
+            percent_education_bachelorup_18up_2021 = 
+              round(total_bachelorup_poplulation_city_2021/total_education_poplulation_city_2021*100, 1),
+            # also try different possibility of limiting age to 18 to 44
+            percent_education_bachelorup_18_44_2021 = 
+              round(total_bachelorup_poplulation_18_44_city_2021/total_education_population_18_44_city_2021*100, 1)
+  ) %>%
+  # select only needed columns for final dataset
+  select(-total_education_poplulation_city_2021, -total_bachelorup_poplulation_city_2021,
+         -total_education_population_18_44_city_2021, -total_bachelorup_poplulation_18_44_city_2021,
+         -percent_education_bachelorup_18_44_2021
+         )
+    
+```
+
+## income
+### NEW import dataset for income
+```{r}
+usincome1_data2 <- read_delim("1ACSST1Y2021.S1901-Data.csv", show_col_types = FALSE)
+```
+
+### adjust the dataset to do further data processing
+```{r}
+usincome1_selected_data2 <- usincome1_data2 %>%
+  # select needed (see notes below to understand the meaning of each column)
+  select(GEO_ID, NAME, S1901_C01_001E, S1901_C01_009E, S1901_C01_009M, S1901_C01_010E, S1901_C01_010M, S1901_C01_011E, S1901_C01_011M, S1901_C01_012E, S1901_C01_012M) %>%
+  filter(GEO_ID != "Geography") %>% # filter out column explanation
+  # separate the city and state name into 2 columns for final dataset
+  separate(NAME, into = c("City", "State"), sep = ", ")
+
+# S1901_C01_001E,"Estimate!!Households!!Total"
+# S1901_C01_009E,"Estimate!!Households!!Percent!!$100,000 to $149,999"
+# S1901_C01_009M,"Margin of Error!!Households!!Percent!!$100,000 to $149,999"
+# S1901_C01_010E,"Estimate!!Households!!Percent!!$150,000 to $199,999"
+# S1901_C01_010M,"Margin of Error!!Households!!Percent!!$150,000 to $199,999"
+# S1901_C01_011E,"Estimate!!Households!!Percent!!$200,000 or more"
+# S1901_C01_011M,"Margin of Error!!Households!!Percent!!$200,000 or more"
+# S1901_C01_012E,"Estimate!!Households!!Median income (dollars)"
+# S1901_C01_012M,"Margin of Error!!Households!!Median income (dollars)"
+```
+
+### process the dataset for targeted values to run regression - city
+```{r}
+usincome1_selected_data_city <- usincome1_selected_data2 %>%
+  # filter out those with the same city names but in different states
+  filter(!GEO_ID %in% c("1600000US1702154", "1600000US4804000", #Arlington
+                        "1600000US1703012", #Aurora
+                        "1600000US1258350", #Charlotte
+                        "1600000US1319000", #Columbus
+                        "1600000US3722920", #Fayetteville
+                        "1600000US3734200", #Jacksonville
+                        "1600000US2036000", #Kansas City
+                        "1600000US0616532", #Mesa
+                        "1600000US2360545" #Portland
+                        )) %>%
+  # adjust the name of city for further filtering
+  { .[["City"]][.["City"] == "Arlington CDP"] <- "Arlington city"; . } %>%
+  { .[["City"]][.["City"] == "Boise City city"] <- "Boise city"; . } %>%
+  { .[["City"]][.["City"] == "Urban Honolulu CDP"] <- "Honolulu city"; . } %>%
+  { .[["City"]][.["City"] == "Indianapolis city (balance)"] <- "Indianapolis city"; . } %>%
+  { .[["City"]][.["City"] == "Louisville/Jefferson County metro government (balance)"] <- "Louisville city"; . } %>%
+  { .[["City"]][.["City"] == "Nashville-Davidson metropolitan government (balance)"] <- "Nashville city"; . } %>%
+  # ensure columns are numeric if they are not already
+  mutate(across(c("S1901_C01_001E", "S1901_C01_009E", "S1901_C01_010E", "S1901_C01_011E", "S1901_C01_012E"), as.numeric)) %>%
+  # create a new column with the sum of households in > 100k income range
+  mutate(sum_wealth_larger_100k = rowSums(select(., c("S1901_C01_009E", "S1901_C01_010E", "S1901_C01_011E")), na.rm = TRUE)*S1901_C01_001E/100) %>%
+  # select only needed
+  select(GEO_ID, City, State, S1901_C01_001E, S1901_C01_012E, sum_wealth_larger_100k) %>% 
+  mutate(City = str_replace(City, "\\s*(city)$", "")) %>%
+  # filter the cities to match the Helium dataset
+  filter(City %in% c("Albuquerque", "Alexandria", "Anaheim", "Arlington", "Atlanta",
+            "Aurora", "Austin", "Bakersfield", "Baltimore", "Boca Raton",
+            "Boise", "Boston", "Bronx", "Brooklyn", "Buffalo",
+            "Cape Coral", "Charlotte", "Chicago", "Chula Vista", "Cincinnati",
+            "Cleveland", "Colorado Springs", "Columbus", "Dallas", "Denver",
+            "El Paso", "Fayetteville", "Fort Lauderdale", "Fort Worth", "Fremont",
+            "Fresno", "Henderson", "Hialeah", "Honolulu", "Houston",
+            "Huntington Beach", "Indianapolis", "Irvine", "Jacksonville", "Jersey City",
+            "Kansas City", "Katy", "Las Vegas", "Long Beach", "Los Angeles",
+            "Louisville", "Memphis", "Mesa", "Miami", "Milwaukee",
+            "Minneapolis", "Nashville", "New York", "Oakland", "Omaha",
+            "Orlando", "Philadelphia", "Phoenix", "Pittsburgh", "Plano",
+            "Portland", "Queens", "Raleigh", "Reno", "Riverside",
+            "Sacramento", "Salt Lake City", "San Antonio", "San Diego", "San Francisco",
+            "San Jose", "Santa Clarita", "Scottsdale", "Seattle", "Spring",
+            "St. Louis", "St. Petersburg", "Tampa", "Tucson", "Washington",
+            "West Palm Beach", "Wichita")) %>%
+  group_by(City) %>%
+  # calculate the average median and the percentage of people who earn > 100K per year in each state
+  summarise(avg_median_income_city_2021 = sum(S1901_C01_012E, na.rm = TRUE)/n(),
+            percent_wealth_people_2021 = round(sum(sum_wealth_larger_100k)/sum(S1901_C01_001E)*100, 1)) %>%
+  select(-percent_wealth_people_2021)
+
+# pick 100k as wealth threshold because on average the expense of household per year is around 75k and average income is around 94k before tax: https://www.bankrate.com/banking/savings/average-household-budget/#faqs
+
+```
+
+
+## age
+### import dataset for age
+```{r}
+usage1_data2 <- read_delim("1ACSST1Y2021.S0101-Data.csv", show_col_types = FALSE)
+```
+
+### (Need adjust) adjust the dataset to do further data processing
+```{r}
+usage1_selected_data2 <- usage1_data2 %>%
+  # filter people whose age is between 20 and 50 -> young people
+  select(GEO_ID, NAME, S0101_C01_001E, S0101_C01_006E, S0101_C01_007E, S0101_C01_008E, S0101_C01_009E, S0101_C01_010E, S0101_C01_011E, S0101_C01_012E, S0101_C01_013E) %>% 
+  # filter out column explanation
+  filter(GEO_ID != "Geography") %>% 
+  # separate city and state into 2 columns to match with Helium dataset
+  separate(NAME, into = c("City", "State"), sep = ", ")
+
+
+# S0101_C01_001E,"Estimate!!Total!!Total population"
+# S0101_C01_006E,"Estimate!!Total!!Total population!!AGE!!20 to 24 years"
+# S0101_C01_007E,"Estimate!!Total!!Total population!!AGE!!25 to 29 years"
+# S0101_C01_008E,"Estimate!!Total!!Total population!!AGE!!30 to 34 years"
+# S0101_C01_009E,"Estimate!!Total!!Total population!!AGE!!35 to 39 years"
+# S0101_C01_010E,"Estimate!!Total!!Total population!!AGE!!40 to 44 years"
+# S0101_C01_011E,"Estimate!!Total!!Total population!!AGE!!45 to 49 years"
+# S0101_C01_012E,"Estimate!!Total!!Total population!!AGE!!50 to 54 years"
+# S0101_C01_013E,"Estimate!!Total!!Total population!!AGE!!55 to 59 years"
+```
+
+### process the dataset for targeted values to run regression - state
+```{r}
+usage1_selected_data_city <- usage1_selected_data2 %>%
+  # filter out those with the same city names but in different states
+  filter(!GEO_ID %in% c("1600000US1702154", "1600000US4804000", #Arlington
+                        "1600000US1703012", #Aurora
+                        "1600000US1258350", #Charlotte
+                        "1600000US1319000", #Columbus
+                        "1600000US3722920", #Fayetteville
+                        "1600000US3734200", #Jacksonville
+                        "1600000US2036000", #Kansas City
+                        "1600000US0616532", #Mesa
+                        "1600000US2360545" #Portland
+                        )) %>%
+  # adjust the name of city for further filtering
+  { .[["City"]][.["City"] == "Arlington CDP"] <- "Arlington city"; . } %>%
+  { .[["City"]][.["City"] == "Boise City city"] <- "Boise city"; . } %>%
+  { .[["City"]][.["City"] == "Urban Honolulu CDP"] <- "Honolulu city"; . } %>%
+  { .[["City"]][.["City"] == "Indianapolis city (balance)"] <- "Indianapolis city"; . } %>%
+  { .[["City"]][.["City"] == "Louisville/Jefferson County metro government (balance)"] <- "Louisville city"; . } %>%
+  { .[["City"]][.["City"] == "Nashville-Davidson metropolitan government (balance)"] <- "Nashville city"; . } %>%
+  # ensure columns are numeric if they are not already
+  mutate(across(c("S0101_C01_001E", "S0101_C01_006E", "S0101_C01_007E", "S0101_C01_008E",
+                  "S0101_C01_009E", "S0101_C01_010E", "S0101_C01_011E", "S0101_C01_012E",
+                  "S0101_C01_013E"), as.numeric)) %>%
+  # sum up the number of people who age between 20 to 50
+  mutate(sum_population_20_50 = rowSums(
+    select(., c("S0101_C01_006E", "S0101_C01_007E", "S0101_C01_008E", "S0101_C01_009E"),
+                "S0101_C01_010E", "S0101_C01_011E"), 
+    na.rm = TRUE)) %>%
+  mutate(City = str_replace(City, "\\s*(city)$", "")) %>%
+  # filter the cities to match the Helium dataset
+  filter(City %in% c("Albuquerque", "Alexandria", "Anaheim", "Arlington", "Atlanta",
+            "Aurora", "Austin", "Bakersfield", "Baltimore", "Boca Raton",
+            "Boise", "Boston", "Bronx", "Brooklyn", "Buffalo",
+            "Cape Coral", "Charlotte", "Chicago", "Chula Vista", "Cincinnati",
+            "Cleveland", "Colorado Springs", "Columbus", "Dallas", "Denver",
+            "El Paso", "Fayetteville", "Fort Lauderdale", "Fort Worth", "Fremont",
+            "Fresno", "Henderson", "Hialeah", "Honolulu", "Houston",
+            "Huntington Beach", "Indianapolis", "Irvine", "Jacksonville", "Jersey City",
+            "Kansas City", "Katy", "Las Vegas", "Long Beach", "Los Angeles",
+            "Louisville", "Memphis", "Mesa", "Miami", "Milwaukee",
+            "Minneapolis", "Nashville", "New York", "Oakland", "Omaha",
+            "Orlando", "Philadelphia", "Phoenix", "Pittsburgh", "Plano",
+            "Portland", "Queens", "Raleigh", "Reno", "Riverside",
+            "Sacramento", "Salt Lake City", "San Antonio", "San Diego", "San Francisco",
+            "San Jose", "Santa Clarita", "Scottsdale", "Seattle", "Spring",
+            "St. Louis", "St. Petersburg", "Tampa", "Tucson", "Washington",
+            "West Palm Beach", "Wichita")) %>%
+  group_by(City) %>%
+  # calculate the percentage of young people to examine the population structure by age
+  summarise(sum_young_20_50_2021 = sum(sum_population_20_50),
+            sum_total_population = sum(S0101_C01_001E),
+            percent_young_20_50_2021 = round(
+              sum_young_20_50_2021/sum_total_population*100, 1)
+            ) %>%
+  select(-sum_total_population, -sum_young_20_50_2021)
+
+```
+
+## population and population density
+
+### import dataset for population
+```{r}
+uspopulation1_data2 <- read_delim("2ACSDP1Y2021.DP05-Data.csv", show_col_types = FALSE)
+```
+
+### adjust the dataset to do further data processing
+```{r}
+uspopulation1_data_selected2 <- uspopulation1_data2 %>%
+  # separate city and state into 2 columns to match with Helium dataset
+  separate(NAME, into = c("City", "State"), sep = ", ") %>%
+  # filter out column explanation
+  filter(GEO_ID != "Geography")
+
+# DP05_0001E,"Estimate!!SEX AND AGE!!Total population"
+```
+
+### process the dataset for targeted values to run regression - state
+```{r}
+uspopulation1_data_selected_city <- uspopulation1_data_selected2 %>%
+  # filter out those with the same city names but in different states
+  filter(!GEO_ID %in% c("1600000US1702154", "1600000US4804000", #Arlington
+                        "1600000US1703012", #Aurora
+                        "1600000US1258350", #Charlotte
+                        "1600000US1319000", #Columbus
+                        "1600000US3722920", #Fayetteville
+                        "1600000US3734200", #Jacksonville
+                        "1600000US2036000", #Kansas City
+                        "1600000US0616532", #Mesa
+                        "1600000US2360545" #Portland
+                        )) %>%
+  # adjust the name of city for further filtering
+  { .[["City"]][.["City"] == "Arlington CDP"] <- "Arlington city"; . } %>%
+  { .[["City"]][.["City"] == "Boise City city"] <- "Boise city"; . } %>%
+  { .[["City"]][.["City"] == "Urban Honolulu CDP"] <- "Honolulu city"; . } %>%
+  { .[["City"]][.["City"] == "Indianapolis city (balance)"] <- "Indianapolis city"; . } %>%
+  { .[["City"]][.["City"] == "Louisville/Jefferson County metro government (balance)"] <- "Louisville city"; . } %>%
+  { .[["City"]][.["City"] == "Nashville-Davidson metropolitan government (balance)"] <- "Nashville city"; . } %>%
+  mutate(across("DP05_0001E", as.numeric)) %>%
+  mutate(City = str_replace(City, "\\s*(city)$", "")) %>%
+  # filter the cities to match the Helium dataset
+  filter(City %in% c("Albuquerque", "Alexandria", "Anaheim", "Arlington", "Atlanta",
+            "Aurora", "Austin", "Bakersfield", "Baltimore", "Boca Raton",
+            "Boise", "Boston", "Bronx", "Brooklyn", "Buffalo",
+            "Cape Coral", "Charlotte", "Chicago", "Chula Vista", "Cincinnati",
+            "Cleveland", "Colorado Springs", "Columbus", "Dallas", "Denver",
+            "El Paso", "Fayetteville", "Fort Lauderdale", "Fort Worth", "Fremont",
+            "Fresno", "Henderson", "Hialeah", "Honolulu", "Houston",
+            "Huntington Beach", "Indianapolis", "Irvine", "Jacksonville", "Jersey City",
+            "Kansas City", "Katy", "Las Vegas", "Long Beach", "Los Angeles",
+            "Louisville", "Memphis", "Mesa", "Miami", "Milwaukee",
+            "Minneapolis", "Nashville", "New York", "Oakland", "Omaha",
+            "Orlando", "Philadelphia", "Phoenix", "Pittsburgh", "Plano",
+            "Portland", "Queens", "Raleigh", "Reno", "Riverside",
+            "Sacramento", "Salt Lake City", "San Antonio", "San Diego", "San Francisco",
+            "San Jose", "Santa Clarita", "Scottsdale", "Seattle", "Spring",
+            "St. Louis", "St. Petersburg", "Tampa", "Tucson", "Washington",
+            "West Palm Beach", "Wichita")) %>%
+  group_by(City) %>%
+  summarise(total_population_city_2021 = sum(DP05_0001E))
+
+```
+
+### calculate land area in each state
+```{r}
+usland_data2 <- read_delim("land_area2.csv", show_col_types = FALSE)
+```
+
+```{r}
+usland_data_selected2 <- usland_data2 %>%
+  # rename difficult name for easier processing
+  rename(landarea = `Area (Land, in square miles) (AREALAND_SQMI)`,
+         NAME = `Geographic Area Name (NAME)`) %>%
+  # separate city and state into 2 columns to match with Helium dataset
+  separate(NAME, into = c("City", "State"), sep = ", ")
+
+usland_data_selected_city <- usland_data_selected2 %>%
+  # adjust the name of city for further filtering
+  { .[["City"]][.["City"] == "Arlington CDP"] <- "Arlington city"; . } %>%
+  { .[["City"]][.["City"] == "Boise City city"] <- "Boise city"; . } %>%
+  { .[["City"]][.["City"] == "Urban Honolulu CDP"] <- "Honolulu city"; . } %>%
+  { .[["City"]][.["City"] == "Indianapolis city (balance)"] <- "Indianapolis city"; . } %>%
+  { .[["City"]][.["City"] == "Louisville/Jefferson County metro government (balance)"] <- "Louisville city"; . } %>%
+  { .[["City"]][.["City"] == "Nashville-Davidson metropolitan government (balance)"] <- "Nashville city"; . } %>%
+  mutate(City = str_replace(City, "\\s*(city)$", "")) %>%
+  # filter the cities to match the Helium dataset
+  filter(City %in% c("Albuquerque", "Alexandria", "Anaheim", "Arlington", "Atlanta",
+            "Aurora", "Austin", "Bakersfield", "Baltimore", "Boca Raton",
+            "Boise", "Boston", "Bronx", "Brooklyn", "Buffalo",
+            "Cape Coral", "Charlotte", "Chicago", "Chula Vista", "Cincinnati",
+            "Cleveland", "Colorado Springs", "Columbus", "Dallas", "Denver",
+            "El Paso", "Fayetteville", "Fort Lauderdale", "Fort Worth", "Fremont",
+            "Fresno", "Henderson", "Hialeah", "Honolulu", "Houston",
+            "Huntington Beach", "Indianapolis", "Irvine", "Jacksonville", "Jersey City",
+            "Kansas City", "Katy", "Las Vegas", "Long Beach", "Los Angeles",
+            "Louisville", "Memphis", "Mesa", "Miami", "Milwaukee",
+            "Minneapolis", "Nashville", "New York", "Oakland", "Omaha",
+            "Orlando", "Philadelphia", "Phoenix", "Pittsburgh", "Plano",
+            "Portland", "Queens", "Raleigh", "Reno", "Riverside",
+            "Sacramento", "Salt Lake City", "San Antonio", "San Diego", "San Francisco",
+            "San Jose", "Santa Clarita", "Scottsdale", "Seattle", "Spring",
+            "St. Louis", "St. Petersburg", "Tampa", "Tucson", "Washington",
+            "West Palm Beach", "Wichita")) %>%
+  group_by(City, State) %>%
+  # sum up total land area in each city
+  summarise(landarea_city = sum(landarea)) %>%
+  filter(
+    # keep specific city-state combinations
+    (City == "Albuquerque" & State == "New Mexico") |
+    (City == "Alexandria" & State == "Virginia") |
+    (City == "Anaheim" & State == "California") |
+    (City == "Arlington" & State == "Virginia") |
+    (City == "Atlanta" & State == "Georgia") |
+    (City == "Aurora" & State == "Colorado") |
+    (City == "Austin" & State == "Texas") |
+    (City == "Bakersfield" & State == "California") |
+    (City == "Baltimore" & State == "Maryland") |
+    (City == "Boca Raton" & State == "Florida") |
+    (City == "Boise" & State == "Idaho") |
+    (City == "Boston" & State == "Massachusetts") |
+    (City == "Buffalo" & State == "New York") |
+    (City == "Cape Coral" & State == "Florida") |
+    (City == "Charlotte" & State == "North Carolina") |
+    (City == "Chicago" & State == "Illinois") |
+    (City == "Chula Vista" & State == "California") |
+    (City == "Cincinnati" & State == "Ohio") |
+    (City == "Cleveland" & State == "Ohio") |
+    (City == "Colorado Springs" & State == "Colorado") |
+    (City == "Columbus" & State == "Ohio") |
+    (City == "Dallas" & State == "Texas") |
+    (City == "Denver" & State == "Colorado") |
+    (City == "El Paso" & State == "Texas") |
+    (City == "Fayetteville" & State == "Arkansas") |
+    (City == "Fort Lauderdale" & State == "Florida") |
+    (City == "Fort Worth" & State == "Texas") |
+    (City == "Fremont" & State == "California") |
+    (City == "Fresno" & State == "California") |
+    (City == "Henderson" & State == "Nevada") |
+    (City == "Hialeah" & State == "Florida") |
+    (City == "Honolulu" & State == "Hawaii") |
+    (City == "Houston" & State == "Texas") |
+    (City == "Huntington Beach" & State == "California") |
+    (City == "Indianapolis" & State == "Indiana") |
+    (City == "Irvine" & State == "California") |
+    (City == "Jacksonville" & State == "Florida") |
+    (City == "Jersey City" & State == "New Jersey") |
+    (City == "Kansas City" & State == "Missouri") |
+    (City == "Las Vegas" & State == "Nevada") |
+    (City == "Long Beach" & State == "California") |
+    (City == "Los Angeles" & State == "California") |
+    (City == "Louisville" & State == "Kentucky") |
+    (City == "Memphis" & State == "Tennessee") |
+    (City == "Mesa" & State == "Arizona") |
+    (City == "Miami" & State == "Florida") |
+    (City == "Milwaukee" & State == "Wisconsin") |
+    (City == "Minneapolis" & State == "Minnesota") |
+    (City == "Nashville" & State == "Tennessee") |
+    (City == "New York" & State == "New York") |
+    (City == "Oakland" & State == "California") |
+    (City == "Omaha" & State == "Nebraska") |
+    (City == "Orlando" & State == "Florida") |
+    (City == "Philadelphia" & State == "Pennsylvania") |
+    (City == "Phoenix" & State == "Arizona") |
+    (City == "Pittsburgh" & State == "Pennsylvania") |
+    (City == "Plano" & State == "Texas") |
+    (City == "Portland" & State == "Oregon") |
+    (City == "Raleigh" & State == "North Carolina") |
+    (City == "Reno" & State == "Nevada") |
+    (City == "Riverside" & State == "California") |
+    (City == "Sacramento" & State == "California") |
+    (City == "Salt Lake City" & State == "Utah") |
+    (City == "San Antonio" & State == "Texas") |
+    (City == "San Diego" & State == "California") |
+    (City == "San Francisco" & State == "California") |
+    (City == "San Jose" & State == "California") |
+    (City == "Santa Clarita" & State == "California") |
+    (City == "Scottsdale" & State == "Arizona") |
+    (City == "Seattle" & State == "Washington") |
+    (City == "Spring" & State == "Texas") |  # Only for age >25 if filtered earlier
+    (City == "St. Louis" & State == "Missouri") |
+    (City == "St. Petersburg" & State == "Florida") |
+    (City == "Tampa" & State == "Florida") |
+    (City == "Tucson" & State == "Arizona") |
+    (City == "Washington" & State == "District of Columbia") |
+    (City == "West Palm Beach" & State == "Florida") |
+    (City == "Wichita" & State == "Kansas")
+  ) %>%
+  ungroup() %>%
+  select(-State)
+  
+```
+
+### combine population and land area
+```{r}
+population_land_city_2021 <- uspopulation1_data_selected_city %>%
+  # combine population and land area datasets to do calculation
+  left_join(usland_data_selected_city, by = "City") %>%
+  # calculate the population density
+  mutate(population_density_2021 = round(total_population_city_2021/landarea_city, 1)) %>%
+  select(-total_population_city_2021, -landarea_city)
+```
+
+# combined data - dependent + independent variables
+## combine the dependent variable with independent variables
+```{r}
+full_dataset_dependent_independent_2 <- adoption_speed_US_rogers_uniquecity_selected %>%
+  # combine all datasets to have the final version of dataset
+  left_join(usbroadband_data_county, by = "City") %>%
+  left_join(useducation1_selected_data_city, by = "City") %>%
+  left_join(usincome1_selected_data_city, by = "City") %>%
+  left_join(usage1_selected_data_city, by = "City") %>%
+  left_join(population_land_city_2021, by = "City")
+```
+
+### scale data
+```{r}
+# step 1: Identify numeric columns
+numeric_columns <- full_dataset_dependent_independent_2 %>%
+  select_if(is.numeric)
+
+# step 2: Scale the numeric columns
+scaled_numeric_columns <- scale(numeric_columns)
+
+# step 3: Combine scaled data with non-numeric columns
+scaled_full_dataset <- full_dataset_dependent_independent_2 %>%
+  select_if(~ !is.numeric(.)) %>%
+  bind_cols(as.data.frame(scaled_numeric_columns))
+
+```
+
+
+## get column names
+```{r}
+scaled_full_dataset %>% 
+  # to see if the variable names are correct
+  colnames()
+```
+## export dataset
+```{r}
+# Export the dataset to a CSV file
+write.csv(full_dataset_dependent_independent_2, "full_dataset_dependent_independent_2.csv", row.names = FALSE)
+write.csv(scaled_full_dataset, "scaled_full_dataset.csv", row.names = FALSE)
+```
+
+# Correlation
+```{r}
+correlation_matrix <- scaled_full_dataset %>%
+  # to keep only numeric values
+  select(-City, -State) %>%
+  # calculate correlation
+  cor(use = "complete.obs")  # Calculate the correlation matrix, ignoring NA values
+```
+
+## correlation heat map
+```{r}
+library(Hmisc)
+library(ggtext)
+library(tidyr)
+
+# select only numeric columns
+numeric_data <- scaled_full_dataset %>%
+  select_if(is.numeric)
+
+# calculate correlation matrix and p-values using rcorr()
+correlation_results <- rcorr(as.matrix(numeric_data))
+
+# extract the correlation matrix and p-values matrix
+correlation_matrix <- correlation_results$r
+p_value_matrix <- correlation_results$P
+
+# function to transform p-values into significance level
+p_value_to_stars <- function(p) {
+  ifelse(p < 0.001, "***", 
+  ifelse(p < 0.01, "**", 
+  ifelse(p < 0.05, "*", 
+  ifelse(p < 0.1, ".", " "))))
+}
+
+# apply the function to the p-values
+p_value_stars <- p_value_to_stars(p_value_matrix)
+
+# prepare the data to create correlation heat map
+cor_data <- as.data.frame(as.table(correlation_matrix))
+p_value_data <- as.data.frame(as.table(p_value_stars))
+
+# combine correlation and p-values into one data frame
+cor_data <- cor_data %>%
+  rename(Correlation = Freq) %>%
+  mutate(P_Stars = p_value_data$Freq)
+
+# create the heatmap with p-value significance level
+ggplot(cor_data, aes(Var1, Var2, fill = Correlation)) +
+  # design the correlation heatmap
+  geom_tile(color = "white") +
+  geom_text(aes(label = P_Stars), color = "black", size = 5) +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                       midpoint = 0, limit = c(-1,1), space = "Lab", 
+                       name = "Correlation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+                                   size = 10, hjust = 1),
+        text = element_text(family = "Times New Roman")) +
+  coord_fixed() +
+  labs(title = "Correlation Matrix Heatmap with Significance Levels",
+       x = "", y = "")
+```
+
+
+# Regression
+## get column name
+```{r}
+scaled_full_dataset %>%
+  # get column names for easy processing in the following section
+  colnames()
+```
+
+## separate testing - age and wealth
+```{r}
+# model for days_0_to_2_5 for 2021 data
+model_0_to_2_5_days_AW <- lm(days_0_to_2_5 ~ percent_young_20_50_2021
+                     + avg_median_income_city_2021
+                     , data = scaled_full_dataset)
+# get the result of regression model
+summary(model_0_to_2_5_days_AW)
+
+# Model for days_2_5_to_16 for 2021 data
+model_2_5_16_days_AW <- lm(days_2_5_to_16 ~ percent_young_20_50_2021
+                     + avg_median_income_city_2021
+                     , data = scaled_full_dataset)
+# get the result of regression model
+summary(model_2_5_16_days_AW)
+
+# Model for days_16_to_50 for 2021 data
+model_16_to_50_days_AW <- lm(days_16_to_50 ~ percent_young_20_50_2021
+                     + avg_median_income_city_2021
+                     , data = scaled_full_dataset)
+# get the result of regression model
+summary(model_16_to_50_days_AW)
+```
+
+## separate testing - education, population, internet speed
+```{r}
+
+# Model for days_0_to_2_5 for 2021 data
+model_0_to_2_5_days_EPS <- lm(days_0_to_2_5 ~ percent_education_bachelorup_18up_2021
+                     + population_density_2021
+                     + speed_250_25
+                     , data = scaled_full_dataset)
+# get the result of regression model
+summary(model_0_to_2_5_days_EPS)
+
+# Model for days_2_5_to_16 for 2021 data
+model_2_5_16_days_EPS <- lm(days_2_5_to_16 ~ percent_education_bachelorup_18up_2021
+                     + population_density_2021
+                     + speed_250_25
+                     , data = scaled_full_dataset)
+# get the result of regression model
+summary(model_2_5_16_days_EPS)
+
+# Model for days_16_to_50 for 2021 data
+model_16_to_50_days_EPS <- lm(days_16_to_50 ~ percent_education_bachelorup_18up_2021
+                     + population_density_2021
+                     + speed_250_25
+                     , data = scaled_full_dataset)
+# get the result of regression model
+summary(model_16_to_50_days_EPS)
+```
+
+## regression - all variables
+```{r}
+# Model for days_0_to_2_5 for 2021 data
+model_0_to_2_5_days <- lm(days_0_to_2_5 ~ percent_young_20_50_2021
+                     + percent_education_bachelorup_18up_2021
+                     + avg_median_income_city_2021
+                     + population_density_2021
+                     + speed_250_25,
+                     data = scaled_full_dataset)
+# get the result of regression model
+summary(model_0_to_2_5_days)
+
+# Model for days_2_5_to_16 for 2021 data
+model_2_5_16_days <- lm(days_2_5_to_16 ~ percent_young_20_50_2021
+                     + percent_education_bachelorup_18up_2021
+                     + avg_median_income_city_2021
+                     + population_density_2021
+                     + speed_250_25,
+                     data = scaled_full_dataset)
+# get the result of regression model
+summary(model_2_5_16_days)
+
+# Model for days_16_to_50 for 2021 data
+model_16_to_50_days <- lm(days_16_to_50 ~ percent_young_20_50_2021
+                     + percent_education_bachelorup_18up_2021
+                     + avg_median_income_city_2021
+                     + population_density_2021
+                     + speed_250_25,
+                     data = scaled_full_dataset)
+# get the result of regression model
+summary(model_16_to_50_days)
+
+```
+
